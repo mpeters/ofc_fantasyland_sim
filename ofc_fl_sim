@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""ofc_fl_sim - Open Face Chinese (OFC) Poker Fantasyland solver.
+
+Given a Fantasyland hand of 13-16 cards, find the arrangement into three rows
+(top: 3 cards, middle: 5 cards, bottom: 5 cards) that maximizes royalty points
+without fouling (bottom >= middle >= top in hand strength).
+
+Usage:
+    ./ofc_fl_sim --hand "Ac2c5c9cAd3d4dTdQd5s8sTsKs"
+"""
+
+import argparse
+import sys
+from itertools import combinations
+from collections import Counter
+
+# --------------------------------------------------------------------------- #
+# Card parsing
+# --------------------------------------------------------------------------- #
+
+RANK_VALUE = {c: i for i, c in enumerate("23456789TJQKA", start=2)}
+VALUE_RANK = {v: k for k, v in RANK_VALUE.items()}
+SUITS = set("cdhs")
+
+
+class InputError(Exception):
+    pass
+
+
+def parse_hand(text):
+    """Parse a case-insensitive 2-char-per-card string into a list of cards.
+
+    Each card is a tuple (rank_value:int, suit:str, display:str).
+    """
+    text = "".join(text.split())  # tolerate stray whitespace
+    if len(text) == 0:
+        raise InputError("empty hand")
+    if len(text) % 2 != 0:
+        raise InputError(
+            "hand string must have an even number of characters (2 per card)"
+        )
+
+    cards = []
+    seen = set()
+    for i in range(0, len(text), 2):
+        rc = text[i].upper()
+        sc = text[i + 1].lower()
+        if rc not in RANK_VALUE:
+            raise InputError(f"invalid rank '{text[i]}' in card '{text[i:i+2]}'")
+        if sc not in SUITS:
+            raise InputError(f"invalid suit '{text[i+1]}' in card '{text[i:i+2]}'")
+        display = rc + sc
+        if display in seen:
+            raise InputError(f"duplicate card '{display}'")
+        seen.add(display)
+        cards.append((RANK_VALUE[rc], sc, display))
+
+    n = len(cards)
+    if n < 13 or n > 16:
+        raise InputError(f"hand has {n} cards; expected 13 to 16")
+    return cards
+
+
+# --------------------------------------------------------------------------- #
+# Hand evaluation
+# --------------------------------------------------------------------------- #
+# Categories (shared scale so a 3-card top can be compared with a 5-card row):
+#   0 high card, 1 pair, 2 two pair, 3 trips, 4 straight,
+#   5 flush, 6 full house, 7 quads, 8 straight flush
+#
+# eval returns a tuple (category, *tiebreakers) that sorts correctly with the
+# standard Python tuple comparison.
+
+CAT5_NAMES = {
+    0: "High Card",
+    1: "Pair",
+    2: "Two Pair",
+    3: "Three of a Kind",
+    4: "Straight",
+    5: "Flush",
+    6: "Full House",
+    7: "Four of a Kind",
+    8: "Straight Flush",
+}
+
+CAT3_NAMES = {
+    0: "High Card",
+    1: "Pair",
+    3: "Three of a Kind",
+}
+
+
+def eval5(cards):
+    """Evaluate a 5-card hand, returning a comparable (category, ...) tuple."""
+    ranks = sorted((c[0] for c in cards), reverse=True)
+    suits = [c[1] for c in cards]
+    counts = Counter(ranks)
+    # ordered by (count, rank) descending -> primary tiebreaker ordering
+    ordered = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+    count_shape = [c for _, c in ordered]
+    rank_order = tuple(r for r, _ in ordered)
+
+    is_flush = len(set(suits)) == 1
+    uniq = sorted(set(ranks))
+    is_straight = False
+    straight_high = None
+    if len(uniq) == 5:
+        if uniq[-1] - uniq[0] == 4:
+            is_straight = True
+            straight_high = uniq[-1]
+        elif uniq == [2, 3, 4, 5, 14]:  # wheel A-2-3-4-5
+            is_straight = True
+            straight_high = 5
+
+    if is_straight and is_flush:
+        return (8, straight_high)
+    if count_shape == [4, 1]:
+        return (7,) + rank_order
+    if count_shape == [3, 2]:
+        return (6,) + rank_order
+    if is_flush:
+        return (5,) + tuple(ranks)
+    if is_straight:
+        return (4, straight_high)
+    if count_shape == [3, 1, 1]:
+        return (3,) + rank_order
+    if count_shape == [2, 2, 1]:
+        return (2,) + rank_order
+    if count_shape == [2, 1, 1, 1]:
+        return (1,) + rank_order
+    return (0,) + tuple(ranks)
+
+
+def eval3(cards):
+    """Evaluate a 3-card (top) hand, returning a comparable (category, ...) tuple."""
+    ranks = sorted((c[0] for c in cards), reverse=True)
+    counts = Counter(ranks)
+    ordered = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+    count_shape = [c for _, c in ordered]
+    rank_order = tuple(r for r, _ in ordered)
+
+    if count_shape == [3]:
+        return (3,) + rank_order
+    if count_shape == [2, 1]:
+        return (1,) + rank_order
+    return (0,) + tuple(ranks)
+
+
+# --------------------------------------------------------------------------- #
+# Royalties (standard OFC scoring)
+# --------------------------------------------------------------------------- #
+
+def top_royalty(ev):
+    cat = ev[0]
+    if cat == 1:  # pair: 66=1 .. AA=9
+        pair_rank = ev[1]
+        return pair_rank - 5 if pair_rank >= 6 else 0
+    if cat == 3:  # trips: 222=10 .. AAA=22
+        return 10 + (ev[1] - 2)
+    return 0
+
+
+def middle_royalty(ev):
+    cat = ev[0]
+    if cat == 3:
+        return 2
+    if cat == 4:
+        return 4
+    if cat == 5:
+        return 8
+    if cat == 6:
+        return 12
+    if cat == 7:
+        return 20
+    if cat == 8:
+        return 50 if ev[1] == 14 else 30  # royal flush vs straight flush
+    return 0
+
+
+def bottom_royalty(ev):
+    cat = ev[0]
+    if cat == 4:
+        return 2
+    if cat == 5:
+        return 4
+    if cat == 6:
+        return 6
+    if cat == 7:
+        return 10
+    if cat == 8:
+        return 25 if ev[1] == 14 else 15
+    return 0
+
+
+def stays_in_fantasyland(top_ev, bottom_ev):
+    """Standard re-Fantasyland rule: trips on top OR quads+ on bottom."""
+    return top_ev[0] == 3 or bottom_ev[0] >= 7
+
+
+def strength_value(ev, slots):
+    """Absolute showdown strength of a hand as a single comparable integer.
+
+    The hand category is the most significant term, followed by the hand's
+    rank tiebreakers (primary ranks before kickers), each padded to a fixed
+    number of slots. This lets per-row strengths be *summed* across the three
+    rows: maximizing that sum maximizes expected rows won at showdown. It also
+    correctly values a change in a hand's primary rank (e.g. the pair that
+    *defines* the middle) far above a change in a trailing kicker (e.g. the
+    pair inside a full house), since primary ranks carry a higher positional
+    weight.
+    """
+    tb = list(ev[1:])
+    tb += [0] * (slots - len(tb))  # pad so category always dominates
+    val = ev[0]
+    for t in tb:
+        val = val * 15 + t
+    return val
+
+
+# --------------------------------------------------------------------------- #
+# Solver
+# --------------------------------------------------------------------------- #
+
+def solve(cards):
+    n = len(cards)
+    idx = list(range(n))
+
+    # Precompute evaluations and royalties for every 5- and 3-card combination.
+    five_map = {}
+    for c in combinations(idx, 5):
+        ev = eval5([cards[i] for i in c])
+        five_map[c] = (ev, bottom_royalty(ev), middle_royalty(ev),
+                       strength_value(ev, 5))
+
+    three_map = {}
+    for c in combinations(idx, 3):
+        ev = eval3([cards[i] for i in c])
+        three_map[c] = (ev, top_royalty(ev), strength_value(ev, 3))
+
+    best = None  # (score_tuple, bottom, middle, top, b_roy, m_roy, t_roy, stay)
+
+    for bottom in combinations(idx, 5):
+        bev, b_roy, _, b_str = five_map[bottom]
+        bottom_set = set(bottom)
+        rest1 = [i for i in idx if i not in bottom_set]
+
+        for middle in combinations(rest1, 5):
+            mev, _, m_roy, m_str = five_map[middle]
+            if mev > bev:  # middle stronger than bottom -> foul
+                continue
+            middle_set = set(middle)
+            rest2 = [i for i in rest1 if i not in middle_set]
+
+            for top in combinations(rest2, 3):
+                tev, t_roy, t_str = three_map[top]
+                if tev > mev:  # top stronger than middle -> foul
+                    continue
+                total = b_roy + m_roy + t_roy
+                stay = stays_in_fantasyland(tev, bev)
+                # Maximize, in priority order:
+                #   1. total royalty points
+                #   2. staying in Fantasyland
+                #   3. combined absolute hand strength across all rows
+                #      (expected rows won vs an opponent at showdown)
+                #   4. bottom/middle/top strength as a final deterministic tie-break
+                score = (total, 1 if stay else 0,
+                         b_str + m_str + t_str, bev, mev, tev)
+                if best is None or score > best[0]:
+                    best = (score, bottom, middle, top, b_roy, m_roy, t_roy, stay)
+
+    return best
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+
+def row_name(ev, size):
+    names = CAT5_NAMES if size == 5 else CAT3_NAMES
+    if ev[0] == 8 and ev[1] == 14:
+        return "Royal Flush"
+    return names[ev[0]]
+
+
+def format_cards(cards, indices):
+    return " ".join(cards[i][2] for i in indices)
+
+
+def print_solution(cards, best):
+    if best is None:
+        print("No valid (non-fouling) arrangement found.")
+        return
+
+    _, bottom, middle, top, b_roy, m_roy, t_roy, stay = best
+    tev = three_map_ev(cards, top)
+    mev = eval5([cards[i] for i in middle])
+    bev = eval5([cards[i] for i in bottom])
+
+    used = set(bottom) | set(middle) | set(top)
+    discarded = [i for i in range(len(cards)) if i not in used]
+
+    rows = [
+        ("Top   ", top, tev, 3, t_roy),
+        ("Middle", middle, mev, 5, m_roy),
+        ("Bottom", bottom, bev, 5, b_roy),
+    ]
+
+    width = max(len(format_cards(cards, r[1])) for r in rows)
+    print()
+    for label, indices, ev, size, roy in rows:
+        cardstr = format_cards(cards, indices).ljust(width)
+        name = row_name(ev, size)
+        roytxt = f"+{roy}" if roy else " 0"
+        print(f"  {label}:  {cardstr}   {name:<16} {roytxt:>4} pts")
+
+    total = t_roy + m_roy + b_roy
+    print("  " + "-" * (width + 32))
+    print(f"  {'Total':<8}  {'':<{width}}   {'':<16} {'+' + str(total):>4} pts")
+    print()
+    print(f"  Stays in Fantasyland: {'YES' if stay else 'no'}")
+    if discarded:
+        print(f"  Discarded: {format_cards(cards, discarded)}")
+    print()
+
+
+def three_map_ev(cards, top):
+    return eval3([cards[i] for i in top])
+
+
+# --------------------------------------------------------------------------- #
+# Simulation
+# --------------------------------------------------------------------------- #
+
+def full_deck():
+    return [(RANK_VALUE[rc], sc, rc + sc)
+            for rc in "23456789TJQKA" for sc in "cdhs"]
+
+
+def format_duration(seconds):
+    """Format a duration in seconds as H:MM:SS or M:SS."""
+    seconds = int(seconds + 0.5)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def run_simulations(n, deal_size, seed):
+    import random
+    import statistics
+    import time
+
+    rng = random.Random(seed)
+    deck = full_deck()
+
+    scores = []
+    fl_count = 0
+    row_royalty_totals = {"top": 0, "middle": 0, "bottom": 0}
+
+    show_progress = n >= 50 and sys.stderr.isatty()
+    start = time.monotonic()
+    last_len = 0
+    for i in range(n):
+        rng.shuffle(deck)
+        best = solve(deck[:deal_size])
+        _, _, _, _, b_roy, m_roy, t_roy, stay = best
+        scores.append(t_roy + m_roy + b_roy)
+        if stay:
+            fl_count += 1
+        row_royalty_totals["top"] += t_roy
+        row_royalty_totals["middle"] += m_roy
+        row_royalty_totals["bottom"] += b_roy
+
+        if show_progress and (i % 25 == 0 or i == n - 1):
+            done = i + 1
+            pct = done * 100 // n
+            elapsed = time.monotonic() - start
+            # Estimate remaining time from the current average run rate.
+            eta = (elapsed / done) * (n - done) if done else 0
+            line = (f"  simulating... {done}/{n} ({pct}%)  "
+                    f"elapsed {format_duration(elapsed)}  "
+                    f"eta {format_duration(eta)}")
+            # Pad to overwrite any longer previous line.
+            print("\r" + line.ljust(last_len), end="", file=sys.stderr,
+                  flush=True)
+            last_len = len(line)
+    if show_progress:
+        total = format_duration(time.monotonic() - start)
+        print("\r" + " " * last_len + "\r", end="", file=sys.stderr, flush=True)
+        print(f"  Completed {n} simulations in {total}.", file=sys.stderr)
+
+    print_simulation_report(scores, fl_count, row_royalty_totals, deal_size)
+
+
+def percentile(sorted_vals, pct):
+    if not sorted_vals:
+        return 0
+    k = (len(sorted_vals) - 1) * (pct / 100)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = k - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+
+def print_simulation_report(scores, fl_count, row_royalty_totals, deal_size):
+    import statistics
+
+    n = len(scores)
+    s = sorted(scores)
+    mean = statistics.fmean(scores)
+    stdev = statistics.pstdev(scores) if n > 1 else 0.0
+
+    print()
+    print(f"  Simulated {n} random {deal_size}-card Fantasyland hands")
+    print()
+    print(f"  Average score:        {mean:6.2f} points")
+    print(f"  Std deviation:        {stdev:6.2f}")
+    print(f"  Min / Median / Max:   {s[0]} / {percentile(s, 50):.0f} / {s[-1]}")
+    print(f"  25th / 75th / 90th:   "
+          f"{percentile(s, 25):.0f} / {percentile(s, 75):.0f} / "
+          f"{percentile(s, 90):.0f}")
+    print(f"  Stays in Fantasyland: {fl_count}/{n} ({fl_count * 100 / n:.1f}%)")
+    print()
+    print("  Average royalties by row:")
+    print(f"    Top:    {row_royalty_totals['top'] / n:5.2f}")
+    print(f"    Middle: {row_royalty_totals['middle'] / n:5.2f}")
+    print(f"    Bottom: {row_royalty_totals['bottom'] / n:5.2f}")
+    print()
+
+    # Histogram in buckets of 5 points.
+    width = 5
+    counts = {}
+    for sc in scores:
+        counts[sc // width] = counts.get(sc // width, 0) + 1
+    max_bucket = max(counts)
+    max_count = max(counts.values())
+    bar_width = 40
+
+    print("  Score distribution:")
+    for b in range(0, max_bucket + 1):
+        c = counts.get(b, 0)
+        lo = b * width
+        hi = lo + width - 1
+        bar = "#" * round(c / max_count * bar_width) if c else ""
+        label = f"{lo:3d}-{hi:<3d}"
+        print(f"    {label}  {bar:<{bar_width}} {c:>5} ({c * 100 / n:4.1f}%)")
+    print()
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="ofc_fl_sim",
+        description="Solve the optimal Fantasyland setting for an OFC poker hand.",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--hand",
+        help='Solve a single hand given as a 2-char-per-card string, '
+             'e.g. "Ac2c5c9cAd3d4dTdQd5s8sTsKs"',
+    )
+    mode.add_argument(
+        "--sims",
+        type=int,
+        metavar="N",
+        help="Instead of solving one hand, deal and solve N random hands and "
+             "report average statistics and the score distribution.",
+    )
+    parser.add_argument(
+        "--cards",
+        type=int,
+        default=13,
+        metavar="K",
+        help="Cards per dealt hand in simulation mode (13-16, default 13).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible simulations.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.hand is not None:
+        try:
+            cards = parse_hand(args.hand)
+        except InputError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        best = solve(cards)
+        print_solution(cards, best)
+        return 0
+
+    # Simulation mode
+    if args.sims <= 0:
+        print("error: --sims must be a positive integer", file=sys.stderr)
+        return 2
+    if not (13 <= args.cards <= 16):
+        print("error: --cards must be between 13 and 16", file=sys.stderr)
+        return 2
+    run_simulations(args.sims, args.cards, args.seed)
+    return 0
+
+
+def _friendly_exit(*_args):
+    """Print a friendly message and exit instead of dumping a traceback."""
+    # Leading newline so the message starts on its own line, clear of any
+    # in-progress progress indicator or the shell's "^C"/"^Z" echo.
+    print("\n\nInterrupted — exiting. Goodbye!", file=sys.stderr)
+    sys.exit(130)
+
+
+if __name__ == "__main__":
+    import signal
+
+    # Ctrl+Z normally suspends the process (SIGTSTP). Catch it so the user
+    # gets a clean goodbye instead of a backgrounded job; also catch SIGINT.
+    if hasattr(signal, "SIGTSTP"):
+        signal.signal(signal.SIGTSTP, _friendly_exit)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:  # Ctrl+C
+        _friendly_exit()
