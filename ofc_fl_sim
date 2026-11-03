@@ -197,6 +197,16 @@ def stays_in_fantasyland(top_ev, bottom_ev):
     return top_ev[0] == 3 or bottom_ev[0] >= 7
 
 
+# Shadow bonus (in royalty points) credited for staying in Fantasyland when
+# *ranking* competing arrangements. Remaining in Fantasyland is worth far more
+# than the current hand's royalties: a fresh 14-card Fantasyland hand scores
+# ~12 bonus points on average and is likely to scoop. We fold a conservative
+# 6-point share of that expected value into the ranking score so the solver
+# will give up a small amount of current-hand royalty to stay in. This is used
+# only for ranking and never appears in the reported scores.
+FANTASYLAND_SHADOW_BONUS = 6
+
+
 def strength_value(ev, slots):
     """Absolute showdown strength of a hand as a single comparable integer.
 
@@ -257,13 +267,19 @@ def solve(cards):
                     continue
                 total = b_roy + m_roy + t_roy
                 stay = stays_in_fantasyland(tev, bev)
+                # Ranking score credits a shadow bonus for staying in
+                # Fantasyland, capturing the expected value of the next
+                # Fantasyland hand (see FANTASYLAND_SHADOW_BONUS). This affects
+                # ranking only; the reported royalties use `total` unchanged.
+                ranking_total = total + (FANTASYLAND_SHADOW_BONUS if stay else 0)
                 # Maximize, in priority order:
-                #   1. total royalty points
+                #   1. shadow-adjusted royalty points (real royalties plus the
+                #      Fantasyland-stay bonus)
                 #   2. staying in Fantasyland
                 #   3. combined absolute hand strength across all rows
                 #      (expected rows won vs an opponent at showdown)
                 #   4. bottom/middle/top strength as a final deterministic tie-break
-                score = (total, 1 if stay else 0,
+                score = (ranking_total, 1 if stay else 0,
                          b_str + m_str + t_str, bev, mev, tev)
                 if best is None or score > best[0]:
                     best = (score, bottom, middle, top, b_roy, m_roy, t_roy, stay)
