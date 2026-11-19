@@ -221,8 +221,17 @@ FANTASYLAND_SHADOW_BONUS = 6
 #   7 four of a kind:  quad rank only (one kicker dead)
 LIVE_TIEBREAKERS = {2: 2, 3: 1, 6: 1, 7: 1}
 
+# The middle row additionally treats a one-pair hand's kickers as dead: it is
+# rare to have to break a middle showdown on a pair's kickers, so hoarding high
+# cards beside a middle pair rarely pays off. Zeroing them instead lets those
+# high cards flow to the top row, which routinely wins (and helps scoop) on a
+# single high card against an opponent holding higher cards up top.
+#
+#   1 one pair:        pair rank only (three kickers dead)
+MIDDLE_LIVE_TIEBREAKERS = {**LIVE_TIEBREAKERS, 1: 1}
 
-def strength_value(ev, slots):
+
+def strength_value(ev, slots, live_tiebreakers=LIVE_TIEBREAKERS):
     """Absolute showdown strength of a hand as a single comparable integer.
 
     The hand category is the most significant term, followed by the hand's
@@ -239,7 +248,7 @@ def strength_value(ev, slots):
     needs just to pad a kicker that will never be compared.
     """
     tb = list(ev[1:])
-    live = LIVE_TIEBREAKERS.get(ev[0])
+    live = live_tiebreakers.get(ev[0])
     if live is not None:
         tb = tb[:live] + [0] * (len(tb) - live)
     tb += [0] * (slots - len(tb))  # pad so category always dominates
@@ -262,7 +271,8 @@ def solve(cards):
     for c in combinations(idx, 5):
         ev = eval5([cards[i] for i in c])
         five_map[c] = (ev, bottom_royalty(ev), middle_royalty(ev),
-                       strength_value(ev, 5))
+                       strength_value(ev, 5),
+                       strength_value(ev, 5, MIDDLE_LIVE_TIEBREAKERS))
 
     three_map = {}
     for c in combinations(idx, 3):
@@ -272,12 +282,12 @@ def solve(cards):
     best = None  # (score_tuple, bottom, middle, top, b_roy, m_roy, t_roy, stay)
 
     for bottom in combinations(idx, 5):
-        bev, b_roy, _, b_str = five_map[bottom]
+        bev, b_roy, _, b_str, _ = five_map[bottom]
         bottom_set = set(bottom)
         rest1 = [i for i in idx if i not in bottom_set]
 
         for middle in combinations(rest1, 5):
-            mev, _, m_roy, m_str = five_map[middle]
+            mev, _, m_roy, _, m_str = five_map[middle]
             if mev > bev:  # middle stronger than bottom -> foul
                 continue
             middle_set = set(middle)
