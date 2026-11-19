@@ -101,6 +101,51 @@ def test_solve_keeps_fantasyland_when_available():
     assert best[-1] is True  # stay
 
 
+def test_trips_in_middle_does_not_steal_high_cards_from_top():
+    # Trips kickers never break a showdown tie, so high cards should go to the
+    # top (which routinely wins on a single high card) rather than padding the
+    # middle trips. Expected: top is K-T-9 high, middle is trips Jacks with the
+    # two lowest available kickers.
+    cards = ofc.parse_hand("9sThKhJdJhJs5c6hAsAdAc7c7d3c")
+    best = ofc.solve(cards)
+    assert_valid_solution(cards, best)
+    _, bottom, middle, top, *_ = unpack(best)
+    bev, mev, tev = evs_for(cards, bottom, middle, top)
+
+    assert mev[0] == 3 and mev[1] == ofc.RANK_VALUE["J"]  # trips Jacks
+    assert tev[0] == 0  # top is a high-card hand
+    top_ranks = sorted((cards[i][0] for i in top), reverse=True)
+    assert top_ranks == [ofc.RANK_VALUE["K"], ofc.RANK_VALUE["T"],
+                         ofc.RANK_VALUE["9"]]
+
+
+def cards5(text):
+    return [(ofc.RANK_VALUE[text[i].upper()], text[i + 1].lower(),
+             text[i].upper() + text[i + 1].lower())
+            for i in range(0, len(text), 2)]
+
+
+def test_strength_value_ignores_dead_kickers():
+    # Trips: the two kickers must not change the strength.
+    t_hi = ofc.eval5(cards5("JdJhJsKhTh"))
+    t_lo = ofc.eval5(cards5("JdJhJs6h5c"))
+    assert ofc.strength_value(t_hi, 5) == ofc.strength_value(t_lo, 5)
+    # Quads kicker and full-house pair rank are likewise dead.
+    q_hi = ofc.eval5(cards5("2c2d2h2sKd"))
+    q_lo = ofc.eval5(cards5("2c2d2h2s3d"))
+    assert ofc.strength_value(q_hi, 5) == ofc.strength_value(q_lo, 5)
+    fh_hi = ofc.eval5(cards5("JdJhJsKhKd"))
+    fh_lo = ofc.eval5(cards5("JdJhJs3h3d"))
+    assert ofc.strength_value(fh_hi, 5) == ofc.strength_value(fh_lo, 5)
+    # Two pair: both pairs are live, but the lone kicker is dead.
+    tp_hi = ofc.eval5(cards5("JdJh5c5dKh"))
+    tp_lo = ofc.eval5(cards5("JdJh5c5d2h"))
+    assert ofc.strength_value(tp_hi, 5) == ofc.strength_value(tp_lo, 5)
+    # ...but a change in a pair rank must still register.
+    tp_other = ofc.eval5(cards5("JdJh6c6dKh"))
+    assert ofc.strength_value(tp_hi, 5) != ofc.strength_value(tp_other, 5)
+
+
 def test_solve_16_card_hand_discards_down_to_13():
     deck = ofc.full_deck()
     text = "".join(c[2] for c in deck[:16])

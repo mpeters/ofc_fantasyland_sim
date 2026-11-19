@@ -207,6 +207,21 @@ def stays_in_fantasyland(top_ev, bottom_ev):
 FANTASYLAND_SHADOW_BONUS = 6
 
 
+# Number of leading tiebreakers that can actually decide a showdown, by
+# category. When you hold three or four of a kind, no opponent can duplicate
+# that rank, so the trailing kickers never break a tie; likewise a full house
+# is decided by its trips rank alone. Zeroing those "dead" kickers keeps the
+# strength heuristic from hoarding high cards in a row that cannot use them
+# (e.g. stuffing a K and T in beside middle trips) when another row — the top,
+# which routinely wins on a single high card — needs them far more.
+#
+#   2 two pair:        both pair ranks (lone kicker dead)
+#   3 three of a kind: trips rank only (two kickers dead)
+#   6 full house:      trips rank only (pair rank dead)
+#   7 four of a kind:  quad rank only (one kicker dead)
+LIVE_TIEBREAKERS = {2: 2, 3: 1, 6: 1, 7: 1}
+
+
 def strength_value(ev, slots):
     """Absolute showdown strength of a hand as a single comparable integer.
 
@@ -218,8 +233,15 @@ def strength_value(ev, slots):
     *defines* the middle) far above a change in a trailing kicker (e.g. the
     pair inside a full house), since primary ranks carry a higher positional
     weight.
+
+    Tiebreakers that can never decide a showdown are zeroed (see
+    LIVE_TIEBREAKERS) so the solver does not sacrifice a high card a weaker row
+    needs just to pad a kicker that will never be compared.
     """
     tb = list(ev[1:])
+    live = LIVE_TIEBREAKERS.get(ev[0])
+    if live is not None:
+        tb = tb[:live] + [0] * (len(tb) - live)
     tb += [0] * (slots - len(tb))  # pad so category always dominates
     val = ev[0]
     for t in tb:
