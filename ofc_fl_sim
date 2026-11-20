@@ -280,41 +280,59 @@ def solve(cards):
         three_map[c] = (ev, top_royalty(ev), strength_value(ev, 3))
 
     best = None  # (score_tuple, bottom, middle, top, b_roy, m_roy, t_roy, stay)
+    best_score = None
+    shadow = FANTASYLAND_SHADOW_BONUS
 
+    # Priority order encoded in `score`, maximized with strict ">" so the first
+    # arrangement found at a given score is kept:
+    #   1. shadow-adjusted royalty points (real royalties plus the
+    #      Fantasyland-stay bonus; see FANTASYLAND_SHADOW_BONUS)
+    #   2. staying in Fantasyland
+    #   3. combined absolute hand strength across all rows
+    #      (expected rows won vs an opponent at showdown)
+    #   4. bottom/middle/top strength as a final deterministic tie-break
+    #
+    # Hot-loop notes: card sets are tracked as integer bitmasks (cheaper than
+    # set() + membership), loop-invariant terms are hoisted, and the full score
+    # tuple is only built when the arrangement can still match-or-beat the
+    # incumbent on its primary key. All of this is pure speed; the search space,
+    # iteration order, and tie-breaking are identical to the straightforward
+    # triple loop, so the chosen arrangement is unchanged.
     for bottom in combinations(idx, 5):
         bev, b_roy, _, b_str, _ = five_map[bottom]
-        bottom_set = set(bottom)
-        rest1 = [i for i in idx if i not in bottom_set]
+        bottom_mask = 0
+        for i in bottom:
+            bottom_mask |= 1 << i
+        rest1 = [i for i in idx if not (bottom_mask >> i) & 1]
+        bottom_is_quads = bev[0] >= 7  # fantasyland-stay via the bottom row
 
         for middle in combinations(rest1, 5):
             mev, _, m_roy, _, m_str = five_map[middle]
             if mev > bev:  # middle stronger than bottom -> foul
                 continue
-            middle_set = set(middle)
-            rest2 = [i for i in rest1 if i not in middle_set]
+            mid_mask = bottom_mask
+            for i in middle:
+                mid_mask |= 1 << i
+            rest2 = [i for i in rest1 if not (mid_mask >> i) & 1]
+            bm_roy = b_roy + m_roy
+            bm_str = b_str + m_str
 
             for top in combinations(rest2, 3):
                 tev, t_roy, t_str = three_map[top]
                 if tev > mev:  # top stronger than middle -> foul
                     continue
-                total = b_roy + m_roy + t_roy
-                stay = stays_in_fantasyland(tev, bev)
-                # Ranking score credits a shadow bonus for staying in
-                # Fantasyland, capturing the expected value of the next
-                # Fantasyland hand (see FANTASYLAND_SHADOW_BONUS). This affects
-                # ranking only; the reported royalties use `total` unchanged.
-                ranking_total = total + (FANTASYLAND_SHADOW_BONUS if stay else 0)
-                # Maximize, in priority order:
-                #   1. shadow-adjusted royalty points (real royalties plus the
-                #      Fantasyland-stay bonus)
-                #   2. staying in Fantasyland
-                #   3. combined absolute hand strength across all rows
-                #      (expected rows won vs an opponent at showdown)
-                #   4. bottom/middle/top strength as a final deterministic tie-break
+                stay = tev[0] == 3 or bottom_is_quads
+                ranking_total = bm_roy + t_roy + (shadow if stay else 0)
+                # Skip building the score tuple when the primary key alone
+                # already rules this arrangement out (the common case).
+                if best_score is not None and ranking_total < best_score[0]:
+                    continue
                 score = (ranking_total, 1 if stay else 0,
-                         b_str + m_str + t_str, bev, mev, tev)
-                if best is None or score > best[0]:
-                    best = (score, bottom, middle, top, b_roy, m_roy, t_roy, stay)
+                         bm_str + t_str, bev, mev, tev)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best = (score, bottom, middle, top,
+                            b_roy, m_roy, t_roy, stay)
 
     return best
 
@@ -394,10 +412,40 @@ def format_duration(seconds):
     return f"{m}:{s:02d}"
 
 
-def run_simulations(n, deal_size, seed):
+def _solve_summary(deal):
+    """Solve one dealt hand and return only the fields the report needs.
+
+    Used as the per-hand work unit when simulations are parallelized: returning
+    this small tuple (instead of the full `solve` result) keeps the data sent
+    back from worker processes tiny.
+    """
+    _, _, _, _, b_roy, m_roy, t_roy, stay = solve(deal)
+    return b_roy, m_roy, t_roy, stay
+
+
+def _deal_stream(n, deal_size, rng, deck):
+    """Yield `n` freshly shuffled `deal_size`-card hands.
+
+    Deals come from a single RNG stream, so for a given seed the sequence is
+    identical whether the hands are then solved serially or farmed out to a
+    process pool (results are recombined in deal order either way).
+    """
+    for _ in range(n):
+        rng.shuffle(deck)
+        yield deck[:deal_size]
+
+
+def run_simulations(n, deal_size, seed, jobs=None):
+    import os
     import random
-    import statistics
     import time
+
+    if jobs is None:
+        jobs = os.cpu_count() or 1
+    # Parallelism only pays off once there is enough work to amortize process
+    # startup and inter-process communication; small runs stay serial.
+    jobs = max(1, min(jobs, n))
+    use_pool = jobs > 1 and n >= 4 * jobs
 
     rng = random.Random(seed)
     deck = full_deck()
@@ -409,30 +457,50 @@ def run_simulations(n, deal_size, seed):
     show_progress = n >= 50 and sys.stderr.isatty()
     start = time.monotonic()
     last_len = 0
-    for i in range(n):
-        rng.shuffle(deck)
-        best = solve(deck[:deal_size])
-        _, _, _, _, b_roy, m_roy, t_roy, stay = best
-        scores.append(t_roy + m_roy + b_roy)
-        if stay:
-            fl_count += 1
-        row_royalty_totals["top"] += t_roy
-        row_royalty_totals["middle"] += m_roy
-        row_royalty_totals["bottom"] += b_roy
 
-        if show_progress and (i % 25 == 0 or i == n - 1):
-            done = i + 1
-            pct = done * 100 // n
-            elapsed = time.monotonic() - start
-            # Estimate remaining time from the current average run rate.
-            eta = (elapsed / done) * (n - done) if done else 0
-            line = (f"  simulating... {done}/{n} ({pct}%)  "
-                    f"elapsed {format_duration(elapsed)}  "
-                    f"eta {format_duration(eta)}")
-            # Pad to overwrite any longer previous line.
-            print("\r" + line.ljust(last_len), end="", file=sys.stderr,
-                  flush=True)
-            last_len = len(line)
+    deals = _deal_stream(n, deal_size, rng, deck)
+    if use_pool:
+        import multiprocessing
+        # "fork" inherits the already-imported module into each worker, so this
+        # works even though the program is an extensionless script (no re-import
+        # by name) and avoids re-running startup in the children.
+        ctx = multiprocessing.get_context("fork")
+        # Batch a handful of hands per task so IPC overhead stays negligible
+        # next to solve time, while keeping enough chunks for load balance.
+        chunksize = max(1, min(32, n // (jobs * 8) or 1))
+        pool = ctx.Pool(jobs)
+        results = pool.imap(_solve_summary, deals, chunksize)
+    else:
+        pool = None
+        results = (_solve_summary(d) for d in deals)
+
+    try:
+        for i, (b_roy, m_roy, t_roy, stay) in enumerate(results):
+            scores.append(t_roy + m_roy + b_roy)
+            if stay:
+                fl_count += 1
+            row_royalty_totals["top"] += t_roy
+            row_royalty_totals["middle"] += m_roy
+            row_royalty_totals["bottom"] += b_roy
+
+            if show_progress and (i % 25 == 0 or i == n - 1):
+                done = i + 1
+                pct = done * 100 // n
+                elapsed = time.monotonic() - start
+                # Estimate remaining time from the current average run rate.
+                eta = (elapsed / done) * (n - done) if done else 0
+                line = (f"  simulating... {done}/{n} ({pct}%)  "
+                        f"elapsed {format_duration(elapsed)}  "
+                        f"eta {format_duration(eta)}")
+                # Pad to overwrite any longer previous line.
+                print("\r" + line.ljust(last_len), end="", file=sys.stderr,
+                      flush=True)
+                last_len = len(line)
+    finally:
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+
     if show_progress:
         total = format_duration(time.monotonic() - start)
         print("\r" + " " * last_len + "\r", end="", file=sys.stderr, flush=True)
@@ -531,6 +599,14 @@ def main(argv=None):
         default=None,
         help="Random seed for reproducible simulations.",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="J",
+        help="Worker processes for simulation mode (default: all CPU cores). "
+             "Use 1 to force serial. Results are identical regardless of J.",
+    )
     args = parser.parse_args(argv)
 
     if args.hand is not None:
@@ -550,7 +626,10 @@ def main(argv=None):
     if not (13 <= args.cards <= 16):
         print("error: --cards must be between 13 and 16", file=sys.stderr)
         return 2
-    run_simulations(args.sims, args.cards, args.seed)
+    if args.jobs is not None and args.jobs < 1:
+        print("error: --jobs must be a positive integer", file=sys.stderr)
+        return 2
+    run_simulations(args.sims, args.cards, args.seed, args.jobs)
     return 0
 
 

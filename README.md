@@ -109,8 +109,13 @@ A live progress indicator with an ETA is shown on `stderr` for larger runs.
 | `--sims N` | Deal and solve `N` random hands and report statistics instead of solving one hand. |
 | `--cards K` | Cards per dealt hand in simulation mode (13–16, default 13). |
 | `--seed S` | Random seed for reproducible simulations. |
+| `--jobs J` | Worker processes for simulation mode (default: all CPU cores). Use `1` to force serial. Results are identical regardless of `J`. |
 
 `--hand` and `--sims` are mutually exclusive; exactly one is required.
+
+Simulations are parallelized across CPU cores by default and produce results
+bit-identical to a serial run for the same `--seed`, so a given seed is fully
+reproducible on any core count.
 
 ## Scoring reference
 
